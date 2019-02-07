@@ -1034,7 +1034,7 @@ HTB{r0p_m3_if_y0u_c4n!}
 
 ### Note to self
 
-This challenge was more difficult that I've expected. At first glance I noticed the buffer overflow and thought immediately that I solved it, silly me. I feel like this challenge was more practical than it was "difficult" in a sense that it was hard to solve, never the less - I have learnt a lot
+This challenge was more difficult that I've expected. At first glance I noticed the buffer overflow and thought immediately that I solved it, silly me. I feel like this challenge was more practical than it was "difficult" in a sense that it was not that hard to solve, but it was rather hard to implement everything and put it all together.
 
 * Stack alignment is a thing when calling functions, **remember that next time you decide to mess around with calls**
 * Leaking addresses can be done not just with format string exploit, but with ROPing to `puts` as well!
