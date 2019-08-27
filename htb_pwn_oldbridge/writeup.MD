@@ -318,3 +318,90 @@ Found: 0xd
 Found: 0xd
 Found: 0x0
 ```
+
+What we have so far:
+
+1. Using the return address we can now learn the **start of the .text section**. We can use gadgets from there, as well as jumping to the @plt of functions there and probably use the Global Offset Table for libc functions to leak libc addresses
+
+2. Using the RBP, we can learn **the address of our buffer on the stack** because the offset from the old rbp and our stack will be fixed regardless of the starting address of the stack section in memory.
+
+Let's start by computing the address of our buffer on the stack. By looking at the server, when the server `read`s our input to `0x7fffffffe110`:
+```
+=> 0x555555554bc9 <check_username+90>:	call   0x555555554970 <read@plt>
+   0x555555554bce <check_username+95>:	mov    DWORD PTR [rbp-0x414],eax
+   0x555555554bd4 <check_username+101>:	mov    DWORD PTR [rbp-0x418],0x0
+   0x555555554bde <check_username+111>:	jmp    0x555555554c0b <check_username+156>
+   0x555555554be0 <check_username+113>:	mov    eax,DWORD PTR [rbp-0x418]
+Guessed arguments:
+arg[0]: 0x4 
+arg[1]: 0x7fffffffe110 --> 0x7ffff7ffe4c8 --> 0x7ffff7ffe428 --> 0x7ffff7ff1510 --> 0x7ffff7ffe170 --> 0x555555554000 (--> ...)
+arg[2]: 0x420 
+```
+
+And if we check out the old rbp value (at the bottom of the stack frame), we can check that value by looking at where our current `rbp` is pointing to `0x00007fffffffe590`:
+
+```
+gdb-peda$ x/4gx $rbp
+0x7fffffffe520:	0x00007fffffffe590	0x0000555555554ecf
+0x7fffffffe530:	0x00007fffffffe678	0x00000002f7dd7660
+gdb-peda$ x/16gx $rbp-0x20
+0x7fffffffe500:	0x4242424242424242	0x4242424242424242
+0x7fffffffe510:	0x4242424242424242	0xc68342c2b57a9500
+0x7fffffffe520:	0x00007fffffffe590	0x0000555555554ecf
+0x7fffffffe530:	0x00007fffffffe678	0x00000002f7dd7660
+0x7fffffffe540:	0x00007fffffffe5a8	0x0000000100000010
+0x7fffffffe550:	0x0000001000000539	0x0000000000000004
+0x7fffffffe560:	0x0000000039050002	0x0000000000000000
+0x7fffffffe570:	0x010011ac589b0002	0x0000000000000000
+```
+
+The distance from old rbp `0x00007fffffffe590` to our buffer `0x7fffffffe110` is `0x480`.
+
+Moving on to the .text section, we leaked a specific address of an instruction inside the `main` function (the one that ends with `0xcf`).<br>
+We can again go back to our server to see the offset of that value from the start of the section
+
+```
+gdb-peda$ bt
+#0  0x0000555555554bce in check_username ()
+#1  0x0000555555554ecf in main ()
+#2  0x00007ffff7a05b97 in __libc_start_main (main=0x555555554c99 <main>, argc=0x2, argv=0x7fffffffe678, init=<optimized out>, fini=<optimized out>, 
+    rtld_fini=<optimized out>, stack_end=0x7fffffffe668) at ../csu/libc-start.c:310
+#3  0x0000555555554a5a in _start ()
+gdb-peda$ vmmap
+Start              End                Perm	Name
+0x0000555555554000 0x0000555555556000 r-xp	/from_host/programming2/challenges/hack_the_box/oldbridge/oldbridge
+0x0000555555755000 0x0000555555756000 r--p	/from_host/programming2/challenges/hack_the_box/oldbridge/oldbridge
+0x0000555555756000 0x0000555555757000 rw-p	/from_host/programming2/challenges/hack_the_box/oldbridge/oldbridge
+0x00007ffff79e4000 0x00007ffff7bcb000 r-xp	/lib/x86_64-linux-gnu/libc-2.27.so
+0x00007ffff7bcb000 0x00007ffff7dcb000 ---p	/lib/x86_64-linux-gnu/libc-2.27.so
+0x00007ffff7dcb000 0x00007ffff7dcf000 r--p	/lib/x86_64-linux-gnu/libc-2.27.so
+0x00007ffff7dcf000 0x00007ffff7dd1000 rw-p	/lib/x86_64-linux-gnu/libc-2.27.so
+0x00007ffff7dd1000 0x00007ffff7dd5000 rw-p	mapped
+0x00007ffff7dd5000 0x00007ffff7dfc000 r-xp	/lib/x86_64-linux-gnu/ld-2.27.so
+0x00007ffff7ff1000 0x00007ffff7ff3000 rw-p	mapped
+0x00007ffff7ff8000 0x00007ffff7ffa000 r--p	[vvar]
+0x00007ffff7ffa000 0x00007ffff7ffc000 r-xp	[vdso]
+0x00007ffff7ffc000 0x00007ffff7ffd000 r--p	/lib/x86_64-linux-gnu/ld-2.27.so
+0x00007ffff7ffd000 0x00007ffff7ffe000 rw-p	/lib/x86_64-linux-gnu/ld-2.27.so
+0x00007ffff7ffe000 0x00007ffff7fff000 rw-p	mapped
+0x00007ffffffde000 0x00007ffffffff000 rw-p	[stack]
+0xffffffffff600000 0xffffffffff601000 r-xp	[vsyscall]
+```
+So the distance between the return address `0x0000555555554bce` and the start of the section `0x0000555555554000` is exactly `0xbce` bytes.
+
+We now have the code section start, as well as the start of our buffer on the stack. The next step that I usually take is to go towards a libc leak and figure out the libc version, but here's where our big problem lies: **we have not space for a ROP chain!** as we cannot override past the return address, what do we do?
+
+### Stack pivoting, create your own stack
+Stack pivoting is a fancy name for replacing the program's `rsp` with a pointer to some area in the memory which you control, how does that help us?
+
+Well, since the end of the `check_username` function is a `ret` instruction, what if we could control the stack pointer to point to somewhere inside our buffer? we would be able to control that `ret`!
+
+To do so we need to change the `rsp`, and we have only 1 jump that we can control in order to get it.
+
+### The LEAVE instruction
+The [leave](https://c9x.me/x86/html/file_module_x86_id_154.html) instruction which is present at the end of the function restores the old stack pointer of the previous frame. The instruction is "leaving" the current frame.<br>
+To do so first: it perform `rsp = rbp`. Restoring the `rsp` to the value from the previous frame.<br>
+I like to think of `leave` as the "`ret`" instruction of the stack.
+
+Great, so if we `ret` to the `leave` instruction again (1 instruction above the original `ret`), we are basically "popping" the rbp again effectively changing the `rsp` to the value of our choosing!<br>
+All that is required of us is to change the return address to the `leave` instruction. After which the program will execute the `leave` and then the `ret`. The `ret` now will return to a value at the stop of the stack, which **is the custom stack now**
